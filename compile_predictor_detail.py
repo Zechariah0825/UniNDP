@@ -90,6 +90,9 @@ def main():
     elif args.architecture == 'hbm-pim':
         SimConfig.read_from_yaml('./config/hbm-pim.yaml')
         Codegen = hbmpim
+    elif args.architecture == 'lpddr-pax':
+        SimConfig.read_from_yaml('./config/lpddr-pax.yaml')
+        Codegen = hbmpim
     elif args.architecture == 'upmem':
         SimConfig.read_from_yaml('./config/upmem.yaml')
         Codegen = upmem
@@ -149,7 +152,7 @@ def main():
     """
     print("processing baseline")
     baseline = None
-    if args.architecture in ['aim', 'aim8']:
+    if args.architecture in ['aim', 'aim8', 'lpddr-pax']:
         for compute_level, pu_num, partition, simd_k, mkl_Input_to_row, simd_l, ml_Out_to_row in design_space:
             if partition[3][0] * partition[3][1] == 1 and (mkl_Input_to_row[0][0] * mkl_Input_to_row[0][2] * mkl_Input_to_row[0][3] == 1 or mkl_Input_to_row[0][1]*simd_k==mm_size[1]):
                 baseline = compute_level, pu_num, partition, simd_k, mkl_Input_to_row, simd_l, ml_Out_to_row

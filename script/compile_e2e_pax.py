@@ -4,6 +4,7 @@ import os
 import sys
 from math import inf
 
+import numpy as np
 import tqdm
 
 try:
@@ -54,6 +55,9 @@ def _setup_architecture(architecture: str, workload: str = "mm"):
         Codegen = aim8
     elif architecture == "hbm-pim":
         SimConfig.read_from_yaml("./config/hbm-pim.yaml")
+        Codegen = hbmpim
+    elif architecture == "lpddr-pax":
+        SimConfig.read_from_yaml("./config/lpddr-pax.yaml")
         Codegen = hbmpim
     elif architecture == "upmem":
         SimConfig.read_from_yaml("./config/upmem.yaml")
@@ -236,7 +240,8 @@ def run_single_mm(
     allow_under_ultize: bool = False,
 ):
     """
-    Compile a single MM workload and return (baseline_latency, best_latency).
+    Compile a single MM workload and return
+    (baseline_latency, baseline_inst_count, best_latency, best_inst_count).
 
     MM workload size is [M, K, N, B] following compile.py semantics.
     """
@@ -278,14 +283,16 @@ def run_single_mm(
         candidate_designs = design_space
 
     best_result = inf
+    best_inst_count = None
     for design_point in candidate_designs:
-        sim_result, _, _ = _run_codegen_and_sim(
+        sim_result, _, inst_count = _run_codegen_and_sim(
             design_point, Codegen, po2, cmd_threshold=0, run_sim=True
         )
         if sim_result is not None and sim_result < best_result:
             best_result = sim_result
+            best_inst_count = inst_count
 
-    return baseline_sim_result, best_result
+    return baseline_sim_result, baseline_inst_count, best_result, best_inst_count
 
 
 def decode_mm_shapes(
@@ -382,7 +389,7 @@ def main():
         "-A",
         type=str,
         default="aim",
-        choices=["aim", "aim8", "hbm-pim", "upmem", "dimmining"],
+        choices=["aim", "aim8", "hbm-pim", "upmem", "dimmining", "lpddr-pax"],
         help="Target architecture for compilation.",
     )
     parser.add_argument(
@@ -421,6 +428,42 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
+    # Prepare predictor and inst info for latency breakdown
+    CodegenHeader = _setup_architecture(args.architecture, workload="mm")
+    _codegen_tmp = CodegenHeader(require_power_of_2=args.po2)
+    predictor_vec = np.array(_codegen_tmp.predictor, dtype=float)
+    inst_len = len(_codegen_tmp.inst_info)
+
+    # Column names for per-instruction latency sheets (must match inst_info order)
+    inst_headers = [
+        "device_pu",
+        "device_pu_col",
+        "device_pu_row_change",
+        "device_reg2buf",
+        "device_buf2reg",
+        "device_buf2bk",
+        "device_buf2bk_col",
+        "device_bk2buf",
+        "device_bk2buf_col",
+        "device_bk2gb",
+        "device_bk2gb_col",
+        "device_gb2bk",
+        "device_gb2bk_col",
+        "host_read",
+        "host_read_col",
+        "host_write",
+        "host_write_col",
+        "host_write_device_buffer",
+        "host_write_device_buffer_col",
+        "host_write_pu_inbuf",
+        "host_write_pu_inbuf_col",
+        "host_read_mac_reg",
+        "host_write_mac_reg",
+    ]
+    assert inst_len == len(
+        inst_headers
+    ), f"Mismatch between inst_info length ({inst_len}) and header ({len(inst_headers)})"
+
     # Iterate over models
     for model_cfg in parse_models_csv(args.models_csv, args.model):
         name = model_cfg["name"]
@@ -443,10 +486,11 @@ def main():
         const_baseline = {}
         const_best = {}
         const_speedup = {}
+        const_best_inst = {}
         for op in const_ops:
             M, K, N, B = shapes_initial[op]
             print(f"  [const op] {op}: MM=({M},{K},{N},{B})")
-            baseline_lat, best_lat = run_single_mm(
+            baseline_lat, baseline_ic, best_lat, best_ic = run_single_mm(
                 M,
                 K,
                 N,
@@ -461,11 +505,15 @@ def main():
             const_baseline[op] = baseline_lat
             const_best[op] = best_lat
             const_speedup[op] = baseline_lat / best_lat if best_lat and best_lat > 0 else 1.0
+            const_best_inst[op] = best_ic
 
         # 3) Sweep context length for qk / kv
         rows_speedup = []
         rows_best = []
         rows_baseline = []
+        # Per-op per-L instruction-level latency breakdown
+        per_op_inst_rows = {op: [] for op in ["qkv_gen", "qk", "kv", "out_proj", "up", "down"]}
+
         for L in range(tk_in, tk_out + 1):
             shapes = decode_mm_shapes(hdim, nheads, dhead, ff_scale, gqaheads, L)
             row_speed = {"Context_len": L}
@@ -482,7 +530,7 @@ def main():
             for op in ["qk", "kv"]:
                 M, K, N, B = shapes[op]
                 print(f"  [L={L}] {op}: MM=({M},{K},{N},{B})")
-                baseline_lat, best_lat = run_single_mm(
+                baseline_lat, _, best_lat, best_ic = run_single_mm(
                     M,
                     K,
                     N,
@@ -497,6 +545,19 @@ def main():
                 row_best[op] = best_lat
                 row_base[op] = baseline_lat
                 row_speed[op] = baseline_lat / best_lat if best_lat and best_lat > 0 else 1.0
+
+                # store best inst counts per L for qk/kv
+                per_op_inst_rows[op].append(
+                    [L] + list((np.array(best_ic, dtype=float)[:inst_len] * predictor_vec).tolist())
+                )
+
+            # For const ops, their instruction latency contributions do not depend on L;
+            # still record one row per L for completeness.
+            for op in const_ops:
+                best_ic = const_best_inst[op]
+                per_op_inst_rows[op].append(
+                    [L] + list((np.array(best_ic, dtype=float)[:inst_len] * predictor_vec).tolist())
+                )
 
             rows_speedup.append(row_speed)
             rows_best.append(row_best)
@@ -560,6 +621,14 @@ def main():
                     row["down"],
                 ]
             )
+
+        # Additional sheets: per-operator instruction-level latency breakdown
+        inst_header_row = ["Context_len"] + inst_headers
+        for op in ["qkv_gen", "qk", "kv", "out_proj", "up", "down"]:
+            ws_op = wb.create_sheet(op)
+            ws_op.append(inst_header_row)
+            for row in per_op_inst_rows[op]:
+                ws_op.append(row)
 
         os.makedirs(args.output_dir, exist_ok=True)
         wb.save(out_path_xlsx)

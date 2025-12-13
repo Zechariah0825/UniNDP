@@ -92,6 +92,9 @@ def main():
     elif args.architecture == 'hbm-pim':
         SimConfig.read_from_yaml('./config/hbm-pim.yaml')
         Codegen = hbmpim
+    elif args.architecture == 'lpddr-pax':
+        SimConfig.read_from_yaml('./config/lpddr-pax.yaml')
+        Codegen = hbmpim
     elif args.architecture == 'upmem':
         SimConfig.read_from_yaml('./config/upmem.yaml')
         Codegen = upmem

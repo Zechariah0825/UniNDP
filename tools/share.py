@@ -10,7 +10,8 @@ class SimConfig:
 
     @classmethod
     def read_from_yaml(cls, yaml_file):
-        with open(yaml_file, 'r') as file:
+        # Use UTF-8 to avoid locale-dependent decode issues on Windows (e.g., GBK).
+        with open(yaml_file, 'r', encoding='utf-8') as file:
             data = yaml.safe_load(file)
             for key, value in data.items():
                 setattr(cls, key, value)

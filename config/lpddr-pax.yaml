@@ -1,0 +1,91 @@
+# time interval: 1ns (same convention as other configs)
+# LPDDR4-like timing parameters.
+# NOTE: Timing values marked "from PAX" are taken directly from
+#       PAX_unit_V23_GlobOPT.py (LPDDR4 section, with tCK normalized to 1).
+#       Values marked "approx" are simple assumptions to make the model work;
+#       you should tweak them if you have more accurate LPDDR numbers.
+#
+# From PAX_unit_V23_GlobOPT.py (LPDDR4 block):
+#   Channels_Perdie_LPDDR4 = 1
+#   PIMUnits_pBANK_LPDDR4  = 1
+#   Chip_dies_LPDDR4       = 8
+#   For PIM_type == 'LPDDR4':
+#       CLK_freq = 2 * 1e9
+#       tCK      = 1
+#       tRRD     = 15 * tCK
+#       tCCD     = 8 * tCK     -> tCCDL/tCCDS (approx)
+#       tRCD     = 36 * tCK    -> tRCDRD/tRCDWR
+#       tRTP     = 16 * tCK    -> tRTPL
+#       WL       = 18 * tCK
+#       RL       = 36 * tCK
+#       BL       = 16
+#       tWR      = 40 * tCK
+#       tFAW     = 60 * tCK
+#       tRAS     = 84 * tCK
+#       tRP      = 42 * tCK
+#       tRC      = 126 * tCK
+#       DQ_bitwidth = 16
+#       Bank_num_pCH = 8
+
+# data precision
+data_pr: 16 # bit
+
+# device level geometry (LPDDR4 / McDRAM, Table I in PAX)
+ro: 16384           # #Row per bank (assumed)
+co: 64              # #Column per row (from Table I: RowBufSize = 16Kb, DQ=x16 → 1024 bits → 64 columns)
+co_w: 256           # data width per PU (16 lanes × 16b) = 256b
+bg: 1               # #Bank groups per channel (LPDDR4: 4 BG, but AiM/McDRAM uses BK_perCH × BK_perBG => here we model 1 BG × 8 BK = 8 banks)
+ba: 8               # #Bank per channel (from Table I: #Bank = 64, with ch=8 → 8 per channel)
+de_pu:
+- 8                 # #PU per device (PE_perBK × BK_perCH = 1×8 = 8)
+de_pu_bf: 16384     # InBufSize = 2048B = 2048*8b
+de_pu_inbuf: 16384  # OutBufSize = 2048B = 2048*8b
+de_pu_bf_rl: 1
+de_pu_bf_wl: 1
+de_pu_w:            # pu_parallelism, MM(oh,ow,v)
+- 1
+- 1
+- 8                 # #SIMDlane = 8 (Table I)
+de_gb: 0
+de_gb_rl: 1
+de_gb_wl: 1
+
+# rank level (simplified: 1 device per channel)
+de: 1
+de_w: 16           # DQ width per device (x16, Table I)
+ra_pu: 0
+ra_pu_bf: 0
+ra_pu_bf_rl: 1
+ra_pu_bf_wl: 1
+
+ra_gb: 0
+ra_gb_rl: 1
+ra_gb_wl: 1
+
+# channel level
+ra: 1
+
+# system level (from Table I: #CH=2 per die, #Die=4 → 8 channels)
+ch: 8
+ch_w: 16          # 16-bit channel width (x16)
+host_w:
+host_t:
+host_reduce_t:
+
+# Timing config (LPDDR4-like)
+# All values below that match PAX comments are "from PAX".
+# tCCDL / tCCDS / tWTRL are approximated based on PAX's tCCD and DDR-style write→read gaps.
+tCCDL: 8        # approx, LPDDR4 tCCD
+tCCDS: 8        # approx, same as tCCDL
+tRCDWR: 36      # from PAX: tRCD
+tRCDRD: 36      # from PAX: tRCD
+tRP: 42         # from PAX: tRP
+tWR: 40         # from PAX: tWR
+tRTPL: 16      # from PAX: tRTP
+tWTRL: 12      # approx
+tRTRS: 1       # approx (bus turnaround)
+RL: 36         # from PAX: RL
+WL: 18         # from PAX: WL
+BL: 16         # from PAX: BL
+
+
