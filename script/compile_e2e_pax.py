@@ -386,7 +386,7 @@ def main():
         help="If specified, only process this model name (must match 'name' column).",
     )
     parser.add_argument(
-        "--batch-size",
+        "--batchsize",
         type=int,
         default=1,
         help="Batch size B, default is 1.",
