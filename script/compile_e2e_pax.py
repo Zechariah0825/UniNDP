@@ -472,7 +472,7 @@ def main():
     ), f"Mismatch between inst_info length ({inst_len}) and header ({len(inst_headers)})"
 
     # Batch size is processed here because it is used in decode_mm_shapes.
-    batch=args.batch_size
+    batch=args.batchsize
     print(f"Processing batch size {batch}")
     # Iterate over models
     batch=args.batchsize
