@@ -317,11 +317,7 @@ def decode_mm_shapes(
     shapes = {}
 
     # Use q_gen as representative of qkv_gen (k_gen/v_gen have same shape).
-<<<<<<< HEAD
-    shapes["qkv_gen"] = (batch, hdim, hdim, 1)
-=======
     shapes["qkv_gen"] = (1, hdim, hdim, batch)
->>>>>>> b8b36878a6ab19d5e97989a252a9ccd208dd2dde
 
     if use_gqa:
         group_dim = dhead * kv_heads  # = d_model / groups
@@ -390,17 +386,10 @@ def main():
         help="If specified, only process this model name (must match 'name' column).",
     )
     parser.add_argument(
-<<<<<<< HEAD
-        "--batchsize",
-        type=int,
-        default=1,
-        help="Batch size for each model, default is 1.",
-=======
         "--batch-size",
         type=int,
         default=1,
         help="Batch size B, default is 1.",
->>>>>>> b8b36878a6ab19d5e97989a252a9ccd208dd2dde
     )
     parser.add_argument(
         "--architecture",
