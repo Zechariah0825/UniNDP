@@ -84,6 +84,7 @@ def build_decode_rows(
     L: int,
     attn_mode: str,
     vocab_size: int,
+    batch_size: int,
 ) -> List[Row]:
     """
     Single-token decode step.
@@ -100,6 +101,7 @@ def build_decode_rows(
     nheads = cfg.nheads
     dhead = cfg.dhead
     ff_dim = _ff_dim(hdim, cfg.ff_scale)
+    batch=batch_size
     # If gqaheads is 0, we treat it as "no GQA info" and fall back to MHA.
     use_gqa = attn_mode == "gqa" and cfg.gqaheads > 0
     kv_heads = cfg.gqaheads if use_gqa else nheads
@@ -108,15 +110,15 @@ def build_decode_rows(
     rows: List[Row] = []
 
     # QKV projections
-    rows.append(("q_gen", "mm", 1, hdim, hdim, 1))
-    rows.append(("k_gen", "mm", 1, hdim, hdim, 1))
-    rows.append(("v_gen", "mm", 1, hdim, hdim, 1))
+    rows.append(("q_gen", "mm", 1, hdim, hdim, batch))
+    rows.append(("k_gen", "mm", 1, hdim, hdim, batch))
+    rows.append(("v_gen", "mm", 1, hdim, hdim, batch))
 
     # Per-head embedding scale / bias
-    rows.append(("q_emb_mul", "elewise", 1, nheads, 1, dhead))
-    rows.append(("q_emb_add", "elewise", 1, nheads, 1, dhead))
-    rows.append(("k_emb_mul", "elewise", 1, nheads, 1, dhead))
-    rows.append(("k_emb_add", "elewise", 1, nheads, 1, dhead))
+    rows.append(("q_emb_mul", "elewise", 1, nheads, 1, dhead*batch))
+    rows.append(("q_emb_add", "elewise", 1, nheads, 1, dhead*batch))
+    rows.append(("k_emb_mul", "elewise", 1, nheads, 1, dhead*batch))
+    rows.append(("k_emb_add", "elewise", 1, nheads, 1, dhead*batch))
 
     # Attention: QK, softmax, KV
     if use_gqa:
@@ -125,37 +127,37 @@ def build_decode_rows(
         # K  : (d_model / groups, L)
         # S  : (groups, L)
         group_dim = dhead * kv_heads  # = d_model / groups
-        rows.append(("qk", "mm", groups, group_dim, L, 1))
+        rows.append(("qk", "mm", groups, group_dim, L, batch))
         # Softmax over length-L scores for each group (approximate encoding)
-        rows.append(("softmax", "softmax", groups, L, 1, 1))
+        rows.append(("softmax", "softmax", groups, L, 1, batch))
         # KV: S (groups, nheads * L)  @  V (nheads * L, dhead)
-        rows.append(("kv", "mm", groups, nheads * L, dhead, 1))
+        rows.append(("kv", "mm", groups, nheads * L, dhead, batch))
     else:
         # MHA flattening (single-token decode)
         # Q  : (1, d_model)
         # K  : (d_model, L)
         # S  : (1, L)
-        rows.append(("qk", "mm", 1, hdim, L, 1))
+        rows.append(("qk", "mm", 1, hdim, L, batch))
         # Softmax per head over length-L (approximate encoding)
-        rows.append(("softmax", "softmax", L, nheads, 1, 1))
+        rows.append(("softmax", "softmax", L, nheads, 1, batch))
         # KV: S (1, nheads * L)  @  V (nheads * L, dhead)
-        rows.append(("kv", "mm", 1, nheads * L, dhead, 1))
+        rows.append(("kv", "mm", 1, nheads * L, dhead, batch))
 
     # Output projection from attention
-    rows.append(("out_proj", "mm", 1, hdim, hdim, 1))
-    rows.append(("out_add", "elewise", hdim, 1, 1, 1))
-    rows.append(("out_rms_norm", "elewise", hdim, 1, 1, 1))
+    rows.append(("out_proj", "mm", 1, hdim, hdim, batch))
+    rows.append(("out_add", "elewise", hdim, 1, 1, batch))
+    rows.append(("out_rms_norm", "elewise", hdim, 1, 1, batch))
 
     # FFN (SwiGLU-style: up, gate, down)
-    rows.append(("up", "mm", 1, hdim, ff_dim, 1))
-    rows.append(("gate", "mm", 1, hdim, ff_dim, 1))
-    rows.append(("up_add", "elewise", ff_dim, 1, 1, 1))
-    rows.append(("down", "mm", 1, ff_dim, hdim, 1))
-    rows.append(("down_add", "elewise", hdim, 1, 1, 1))
+    rows.append(("up", "mm", 1, hdim, ff_dim, batch))
+    rows.append(("gate", "mm", 1, hdim, ff_dim, batch))
+    rows.append(("up_add", "elewise", ff_dim, 1, 1, batch))
+    rows.append(("down", "mm", 1, ff_dim, hdim, batch))
+    rows.append(("down_add", "elewise", hdim, 1, 1, batch))
 
     # Final layer norm + lm head projection
-    rows.append(("final_rms_norm", "elewise", hdim, 1, 1, 1))
-    rows.append(("final_proj", "mm", 1, hdim, vocab_size, 1))
+    rows.append(("final_rms_norm", "elewise", hdim, 1, 1, batch))
+    rows.append(("final_proj", "mm", 1, hdim, vocab_size, batch))
 
     return rows
 
@@ -165,6 +167,7 @@ def build_prefill_rows(
     L: int,
     attn_mode: str,
     vocab_size: int,
+    batch_size: int,
 ) -> List[Row]:
     """
     Prefill (prompt) phase, sequence length = L.
@@ -173,6 +176,7 @@ def build_prefill_rows(
     nheads = cfg.nheads
     dhead = cfg.dhead
     ff_dim = _ff_dim(hdim, cfg.ff_scale)
+    batch=batch_size
     use_gqa = attn_mode == "gqa" and cfg.gqaheads > 0
     kv_heads = cfg.gqaheads if use_gqa else nheads
     groups = nheads // kv_heads if use_gqa else 1
@@ -180,15 +184,15 @@ def build_prefill_rows(
     rows: List[Row] = []
 
     # QKV projections: (L, hdim, hdim, 1)
-    rows.append(("q_gen", "mm", L, hdim, hdim, 1))
-    rows.append(("k_gen", "mm", L, hdim, hdim, 1))
-    rows.append(("v_gen", "mm", L, hdim, hdim, 1))
+    rows.append(("q_gen", "mm", L, hdim, hdim, batch))
+    rows.append(("k_gen", "mm", L, hdim, hdim, batch))
+    rows.append(("v_gen", "mm", L, hdim, hdim, batch))
 
     # Per-head embedding scale / bias
-    rows.append(("q_emb_mul", "elewise", L, nheads, 1, dhead))
-    rows.append(("q_emb_add", "elewise", L, nheads, 1, dhead))
-    rows.append(("k_emb_mul", "elewise", L, nheads, 1, dhead))
-    rows.append(("k_emb_add", "elewise", L, nheads, 1, dhead))
+    rows.append(("q_emb_mul", "elewise", L, nheads, 1, dhead*batch))
+    rows.append(("q_emb_add", "elewise", L, nheads, 1, dhead*batch))
+    rows.append(("k_emb_mul", "elewise", L, nheads, 1, dhead*batch))
+    rows.append(("k_emb_add", "elewise", L, nheads, 1, dhead*batch))
 
     # Attention: QK, softmax, KV
     if use_gqa:
@@ -197,32 +201,32 @@ def build_prefill_rows(
         # K  : (d_model / groups, L)
         # S  : (L * groups, L)
         group_dim = dhead * kv_heads  # = d_model / groups
-        rows.append(("qk", "mm", L * groups, group_dim, L, 1))
+        rows.append(("qk", "mm", L * groups, group_dim, L, batch))
         # Softmax per sequence position within each group
-        rows.append(("softmax", "softmax", L * groups, L, 1, 1))
+        rows.append(("softmax", "softmax", L * groups, L, 1, batch))
         # KV: S (L * groups, nheads * L)  @  V (nheads * L, dhead)
-        rows.append(("kv", "mm", L * groups, nheads * L, dhead, 1))
+        rows.append(("kv", "mm", L * groups, nheads * L, dhead, batch))
     else:
         # MHA prefill (original llama2-style shapes)
-        rows.append(("qk", "mm", L, hdim, L, 1))
-        rows.append(("softmax", "softmax", L, kv_heads, L, 1))
-        rows.append(("kv", "mm", dhead, kv_heads * L, hdim, 1))
+        rows.append(("qk", "mm", L, hdim, L, batch))
+        rows.append(("softmax", "softmax", L, kv_heads, L, batch))
+        rows.append(("kv", "mm", dhead, kv_heads * L, hdim, batch))
 
     # Output projection from attention
-    rows.append(("out_proj", "mm", L, hdim, hdim, 1))
-    rows.append(("out_add", "elewise", L, hdim, 1, 1))
-    rows.append(("out_rms_norm", "elewise", L, hdim, 1, 1))
+    rows.append(("out_proj", "mm", L, hdim, hdim, batch))
+    rows.append(("out_add", "elewise", L, hdim, 1, batch))
+    rows.append(("out_rms_norm", "elewise", L, hdim, 1, batch))
 
     # FFN
-    rows.append(("up", "mm", L, hdim, ff_dim, 1))
-    rows.append(("gate", "mm", L, hdim, ff_dim, 1))
-    rows.append(("up_add", "elewise", ff_dim, L, 1, 1))
-    rows.append(("down", "mm", L, ff_dim, hdim, 1))
-    rows.append(("down_add", "elewise", L, hdim, 1, 1))
+    rows.append(("up", "mm", L, hdim, ff_dim, batch))
+    rows.append(("gate", "mm", L, hdim, ff_dim, batch))
+    rows.append(("up_add", "elewise", ff_dim, L, 1, batch))
+    rows.append(("down", "mm", L, ff_dim, hdim, batch))
+    rows.append(("down_add", "elewise", L, hdim, 1, batch))
 
     # Final norm + projection (only one token projected, following llama2 CSVs)
-    rows.append(("final_rms_norm", "elewise", L, 1, 1, 1))
-    rows.append(("final_proj", "mm", 1, hdim, vocab_size, 1))
+    rows.append(("final_rms_norm", "elewise", L, 1, 1, batch))
+    rows.append(("final_proj", "mm", 1, hdim, vocab_size, batch))
 
     return rows
 
@@ -304,7 +308,12 @@ def parse_args() -> argparse.Namespace:
         default="workload",
         help="Directory to place generated CSV files.",
     )
-
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Batch size B, default is 1.",
+    )
     # Manual hyper-parameters (used only with --manual-name)
     parser.add_argument("--ndec", type=int, help="Decoder layer count.")
     parser.add_argument("--hdim", type=int, help="Model width d_model.")
@@ -340,6 +349,7 @@ def generate_for_model(
     attn: str,
     vocab_size: int,
     workload_dir: str,
+    batch_size: int,
 ) -> None:
     """Generate workloads (E2E + mm-only) for a single model."""
     L = tklen
@@ -354,9 +364,9 @@ def generate_for_model(
         attn_mode = attn
 
     if phase == "decode":
-        rows = build_decode_rows(cfg, L, attn_mode, vocab_size)
+        rows = build_decode_rows(cfg, L, attn_mode, vocab_size, batch_size)
     else:
-        rows = build_prefill_rows(cfg, L, attn_mode, vocab_size)
+        rows = build_prefill_rows(cfg, L, attn_mode, vocab_size, batch_size)
 
     prefix = _normalize_prefix(model_name)
 
