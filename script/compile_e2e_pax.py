@@ -317,7 +317,11 @@ def decode_mm_shapes(
     shapes = {}
 
     # Use q_gen as representative of qkv_gen (k_gen/v_gen have same shape).
+<<<<<<< HEAD
     shapes["qkv_gen"] = (batch, hdim, hdim, 1)
+=======
+    shapes["qkv_gen"] = (1, hdim, hdim, batch)
+>>>>>>> b8b36878a6ab19d5e97989a252a9ccd208dd2dde
 
     if use_gqa:
         group_dim = dhead * kv_heads  # = d_model / groups
@@ -386,10 +390,17 @@ def main():
         help="If specified, only process this model name (must match 'name' column).",
     )
     parser.add_argument(
+<<<<<<< HEAD
         "--batchsize",
         type=int,
         default=1,
         help="Batch size for each model, default is 1.",
+=======
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Batch size B, default is 1.",
+>>>>>>> b8b36878a6ab19d5e97989a252a9ccd208dd2dde
     )
     parser.add_argument(
         "--architecture",
@@ -471,6 +482,9 @@ def main():
         inst_headers
     ), f"Mismatch between inst_info length ({inst_len}) and header ({len(inst_headers)})"
 
+    # Batch size is processed here because it is used in decode_mm_shapes.
+    batch=args.batch_size
+    print(f"Processing batch size {batch}")
     # Iterate over models
     batch=args.batchsize
     for model_cfg in parse_models_csv(args.models_csv, args.model):
@@ -537,7 +551,7 @@ def main():
             # qk / kv: recompute per L
             for op in ["qk", "kv"]:
                 M, K, N, B = shapes[op]
-                print(f"  [L={L}] {op}: MM=({M},{K},{N},{B})")
+                print(f"  [L={L}, B={batch}] {op}: MM=({M},{K},{N},{B})")
                 baseline_lat, _, best_lat, best_ic = run_single_mm(
                     M,
                     K,
