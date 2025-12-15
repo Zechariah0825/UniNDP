@@ -302,6 +302,7 @@ def decode_mm_shapes(
     ff_scale: float,
     gqaheads: int,
     L: int,
+    batch: int,
 ):
     """
     Return MM workload shapes for decode phase for the six ops:
@@ -316,25 +317,25 @@ def decode_mm_shapes(
     shapes = {}
 
     # Use q_gen as representative of qkv_gen (k_gen/v_gen have same shape).
-    shapes["qkv_gen"] = (1, hdim, hdim, 1)
+    shapes["qkv_gen"] = (batch, hdim, hdim, 1)
 
     if use_gqa:
         group_dim = dhead * kv_heads  # = d_model / groups
         # Q: (groups, d_model/groups), K: (d_model/groups, L)
-        shapes["qk"] = (groups, group_dim, L, 1)
+        shapes["qk"] = (groups, group_dim, L, batch)
         # S: (groups, nheads*L), V: (nheads*L, dhead)
-        shapes["kv"] = (groups, nheads * L, dhead, 1)
+        shapes["kv"] = (groups, nheads * L, dhead, batch)
     else:
         # MHA flattening
         # Q: (1, d_model), K: (d_model, L)
-        shapes["qk"] = (1, hdim, L, 1)
+        shapes["qk"] = (1, hdim, L, batch)
         # S: (1, nheads*L), V: (nheads*L, dhead)
-        shapes["kv"] = (1, nheads * L, dhead, 1)
+        shapes["kv"] = (1, nheads * L, dhead, batch)
 
     # Out projection and FFN
-    shapes["out_proj"] = (1, hdim, hdim, 1)
-    shapes["up"] = (1, hdim, ff_dim, 1)
-    shapes["down"] = (1, ff_dim, hdim, 1)
+    shapes["out_proj"] = (1, hdim, hdim, batch)
+    shapes["up"] = (1, hdim, ff_dim, batch)
+    shapes["down"] = (1, ff_dim, hdim, batch)
 
     return shapes
 
@@ -383,6 +384,12 @@ def main():
         type=str,
         default=None,
         help="If specified, only process this model name (must match 'name' column).",
+    )
+    parser.add_argument(
+        "--batchsize",
+        type=int,
+        default=1,
+        help="Batch size for each model, default is 1.",
     )
     parser.add_argument(
         "--architecture",
@@ -465,6 +472,7 @@ def main():
     ), f"Mismatch between inst_info length ({inst_len}) and header ({len(inst_headers)})"
 
     # Iterate over models
+    batch=args.batchsize
     for model_cfg in parse_models_csv(args.models_csv, args.model):
         name = model_cfg["name"]
         hdim = model_cfg["hdim"]
@@ -475,10 +483,10 @@ def main():
         tk_in = model_cfg["tklen_input"]
         tk_out = model_cfg["tklen_output"]
 
-        print(f"Processing model {name} on architecture {args.architecture} (L={tk_in}..{tk_out})")
+        print(f"Processing model {name} on architecture {args.architecture} (L={tk_in}..{tk_out}, batch={batch})")
 
         # 1) Compute shapes at initial L for all ops
-        shapes_initial = decode_mm_shapes(hdim, nheads, dhead, ff_scale, gqaheads, tk_in)
+        shapes_initial = decode_mm_shapes(hdim, nheads, dhead, ff_scale, gqaheads, tk_in, batch)
 
         # 2) Run single-mm compile for ops whose shapes don't change with L:
         #    qkv_gen, out_proj, up, down
@@ -515,7 +523,7 @@ def main():
         per_op_inst_rows = {op: [] for op in ["qkv_gen", "qk", "kv", "out_proj", "up", "down"]}
 
         for L in range(tk_in, tk_out + 1):
-            shapes = decode_mm_shapes(hdim, nheads, dhead, ff_scale, gqaheads, L)
+            shapes = decode_mm_shapes(hdim, nheads, dhead, ff_scale, gqaheads, L, batch)
             row_speed = {"Context_len": L}
             row_best = {"Context_len": L}
             row_base = {"Context_len": L}
