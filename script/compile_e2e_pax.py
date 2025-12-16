@@ -316,8 +316,8 @@ def decode_mm_shapes(
 
     shapes = {}
 
-    # Use q_gen as representative of qkv_gen (k_gen/v_gen have same shape).
-    shapes["qkv_gen"] = (1, hdim, hdim, batch)
+    # Q/K/V share input (hdim) but produce three concatenated projections -> single larger MM
+    shapes["qkv_gen"] = (1, hdim, 3 * hdim, batch)
 
     if use_gqa:
         group_dim = dhead * kv_heads  # = d_model / groups
@@ -430,6 +430,11 @@ def main():
         default="pruning_and_breakdown/e2e_pax",
         help="Directory to place per-model decode speedup CSVs.",
     )
+    parser.add_argument(
+        "--dump-workload",
+        action="store_true",
+        help="If set, also emit a workload CSV (Context_len/op/M/K/N/B) into --output-dir.",
+    )
 
     args = parser.parse_args()
 
@@ -524,12 +529,18 @@ def main():
         rows_baseline = []
         # Per-op per-L instruction-level latency breakdown
         per_op_inst_rows = {op: [] for op in ["qkv_gen", "qk", "kv", "out_proj", "up", "down"]}
+        workload_rows = [] if args.dump_workload else None
 
         for L in range(tk_in, tk_out + 1):
             shapes = decode_mm_shapes(hdim, nheads, dhead, ff_scale, gqaheads, L, batch)
             row_speed = {"Context_len": L}
             row_best = {"Context_len": L}
             row_base = {"Context_len": L}
+
+            if workload_rows is not None:
+                for op in ["qkv_gen", "qk", "kv", "out_proj", "up", "down"]:
+                    M, K, N, B = shapes[op]
+                    workload_rows.append([L, op, M, K, N, B])
 
             # qkv_gen / out_proj / up / down: reuse const results
             for op in const_ops:
@@ -643,6 +654,15 @@ def main():
 
         os.makedirs(args.output_dir, exist_ok=True)
         wb.save(out_path_xlsx)
+
+        if workload_rows is not None:
+            workload_name = f"{norm_name}_{args.architecture}_decode_workload.csv"
+            workload_path = os.path.join(args.output_dir, workload_name)
+            with open(workload_path, "w", newline="") as wf:
+                writer = csv.writer(wf)
+                writer.writerow(["Context_len", "op", "M", "K", "N", "B"])
+                writer.writerows(workload_rows)
+            print(f"  -> wrote workload {workload_path}")
 
         print(f"  -> wrote {out_path_xlsx}")
 
