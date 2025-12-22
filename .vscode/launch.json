@@ -1,0 +1,42 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug compile_e2e_pax.py",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/pax/compile_e2e_pax.py",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      },
+      "args": [
+        "--models-csv",
+        "script/models_llm.csv",
+        "--model",
+        "GPT3-2.7B",
+        "--architecture",
+        "hbm-pim",
+        "--batchsize",
+        "1",
+        "--output-dir",
+        "debug",
+        "--topk",
+        "5",
+        "--enforce-head-divisible"
+      ]
+    },
+    {
+      "name": "Python: 当前文件",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${file}",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      }
+    }
+  ]
+}

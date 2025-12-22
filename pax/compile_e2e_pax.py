@@ -2,7 +2,8 @@ import argparse
 import csv
 import os
 import sys
-from math import inf
+from math import inf, ceil
+from typing import Optional
 
 import numpy as np
 import tqdm
@@ -35,6 +36,101 @@ def _normalize_model_name(name: str) -> str:
         family, size = name.split("-", 1)
         return f"{family.lower()}_{size}"
     return name.lower()
+
+
+def _format_tuple4(tup) -> str:
+    return ",".join(str(x) for x in tup)
+
+
+def _format_partition(partition) -> str:
+    if SimConfig.pu_level == LEVEL.DE:
+        ch, ra, de, pu = partition
+        parts = [
+            f"ch:{_format_tuple4(ch)}",
+            f"ra:{_format_tuple4(ra)}",
+            f"de:{_format_tuple4(de)}",
+            f"pu:{_format_tuple4(pu)}",
+        ]
+    else:
+        ch, ra, pu = partition
+        parts = [
+            f"ch:{_format_tuple4(ch)}",
+            f"ra:{_format_tuple4(ra)}",
+            f"pu:{_format_tuple4(pu)}",
+        ]
+    return "\n".join(parts)
+
+
+def _format_row_mapping(mapping) -> str:
+    block, row_num, last_row = mapping
+    return "\n".join(
+        [
+            f"block_in_row:{_format_tuple4(block)}",
+            f"row_num:{_format_tuple4(row_num)}",
+            f"last_row:{_format_tuple4(last_row)}",
+        ]
+    )
+
+
+def _append_baseline_row(rows, op, context_len, info):
+    m, k, l, b = info["shape"]
+    partition = info["partition"]
+    if SimConfig.pu_level == LEVEL.DE:
+        ch, ra, de, pu = partition
+        div_m = ch[0] * ra[0] * de[0] * pu[0]
+        div_k = ch[1] * ra[1] * de[1] * pu[1]
+        div_l = ch[2] * ra[2] * de[2] * pu[2]
+    else:
+        ch, ra, pu = partition
+        div_m = ch[0] * ra[0] * pu[0]
+        div_k = ch[1] * ra[1] * pu[1]
+        div_l = ch[2] * ra[2] * pu[2]
+
+    m_sub = ceil(m / div_m)
+    k_sub = ceil(k / div_k)
+    l_sub = ceil(l / div_l)
+
+    mkl_in = info["mkl_input_to_row"]
+    blk = mkl_in[0]
+    rows_k = mkl_in[1][1]
+    m_blk, k_blk, l_blk, _ = blk
+    sub_mk_bank = (rows_k, m_blk * k_blk)
+    sub_kl_bank = (rows_k, l_blk * k_blk)
+
+    rows.append(
+        [
+            op,
+            context_len,
+            m,
+            k,
+            l,
+            b,
+            info["bank_per_pim"],
+            info["input_bank"],
+            f"{m_sub},{k_sub}",
+            f"{sub_mk_bank[0]},{sub_mk_bank[1]}",
+            info["weight_bank"],
+            f"{k_sub},{l_sub}",
+            f"{sub_kl_bank[0]},{sub_kl_bank[1]}",
+            info["output_bank"],
+            info["simd_k"],
+            info["simd_l"],
+            _format_partition(partition),
+            _format_row_mapping(info["mkl_input_to_row"]),
+            _format_row_mapping(info["mkl_output_to_row"]),
+        ]
+    )
+
+
+def _k_split_divides_heads(partition, nheads: int) -> bool:
+    """Return True if the K split product divides the head count."""
+    if SimConfig.pu_level == LEVEL.DE:
+        ch, ra, de, pu = partition
+        k_split = ch[1] * ra[1] * de[1] * pu[1]
+    else:
+        ch, ra, pu = partition
+        k_split = ch[1] * ra[1] * pu[1]
+    return nheads % k_split == 0
 
 
 def _setup_architecture(architecture: str, workload: str = "mm"):
@@ -238,6 +334,11 @@ def run_single_mm(
     topk: int = 30,
     cmdthre: float = 3.0,
     allow_under_ultize: bool = False,
+    baseline_hook=None,
+    op_name: Optional[str] = None,
+    nheads: Optional[int] = None,
+    enforce_head_divisible: bool = False,
+    best_hook=None,
 ):
     """
     Compile a single MM workload and return
@@ -251,11 +352,39 @@ def run_single_mm(
     Codegen = _setup_architecture(architecture, workload="mm")
     design_space = _build_design_space(mm_size, architecture, po2, allow_under_ultize)
 
+    if enforce_head_divisible and op_name in ("qk", "kv"):
+        if nheads is None:
+            raise ValueError("nheads must be provided when enforcing head divisibility for qk/kv.")
+        design_space = [dp for dp in design_space if _k_split_divides_heads(dp[2], nheads)]
+
     if not design_space:
         raise RuntimeError("Empty design space for workload size {}".format(mm_size))
 
     # 2) Baseline
     baseline_dp = _select_baseline(design_space, architecture, mm_size)
+    if baseline_hook and baseline_dp is not None:
+        compute_level, pu_num, partition, simd_k, mkl_input_to_row, simd_l, ml_out_to_row = baseline_dp
+        mapping_tool = Mapping(require_power_of_2=po2)
+        bank_per_pim = (
+            mapping_tool.bank_num // pu_num if SimConfig.pu_level == LEVEL.DE else mapping_tool.device_num // pu_num
+        )
+        input_bank, input_row_offset, weight_bank, weight_row_offset, output_bank, output_row_offset = mapping_tool.assign_dram(
+            pu_num, mkl_input_to_row, ml_out_to_row, partition
+        )
+        baseline_hook(
+            {
+                "shape": (M, K, N, B),
+                "partition": partition,
+                "simd_k": simd_k,
+                "simd_l": simd_l,
+                "mkl_input_to_row": mkl_input_to_row,
+                "mkl_output_to_row": ml_out_to_row,
+                "bank_per_pim": bank_per_pim,
+                "input_bank": input_bank,
+                "weight_bank": weight_bank,
+                "output_bank": output_bank,
+            }
+        )
     baseline_sim_result, _, baseline_inst_count = _run_codegen_and_sim(
         baseline_dp, Codegen, po2, cmd_threshold=0, run_sim=True
     )
@@ -284,6 +413,7 @@ def run_single_mm(
 
     best_result = inf
     best_inst_count = None
+    best_dp = None
     for design_point in candidate_designs:
         sim_result, _, inst_count = _run_codegen_and_sim(
             design_point, Codegen, po2, cmd_threshold=0, run_sim=True
@@ -291,7 +421,31 @@ def run_single_mm(
         if sim_result is not None and sim_result < best_result:
             best_result = sim_result
             best_inst_count = inst_count
+            best_dp = design_point
 
+    if best_hook and best_dp is not None:
+        compute_level, pu_num, partition, simd_k, mkl_input_to_row, simd_l, ml_out_to_row = best_dp
+        mapping_tool = Mapping(require_power_of_2=po2)
+        bank_per_pim = (
+            mapping_tool.bank_num // pu_num if SimConfig.pu_level == LEVEL.DE else mapping_tool.device_num // pu_num
+        )
+        input_bank, input_row_offset, weight_bank, weight_row_offset, output_bank, output_row_offset = mapping_tool.assign_dram(
+            pu_num, mkl_input_to_row, ml_out_to_row, partition
+        )
+        best_hook(
+            {
+                "shape": (M, K, N, B),
+                "partition": partition,
+                "simd_k": simd_k,
+                "simd_l": simd_l,
+                "mkl_input_to_row": mkl_input_to_row,
+                "mkl_output_to_row": ml_out_to_row,
+                "bank_per_pim": bank_per_pim,
+                "input_bank": input_bank,
+                "weight_bank": weight_bank,
+                "output_bank": output_bank,
+            }
+        )
     return baseline_sim_result, baseline_inst_count, best_result, best_inst_count
 
 
@@ -435,6 +589,18 @@ def main():
         action="store_true",
         help="If set, also emit a workload CSV (Context_len/op/M/K/N/B) into --output-dir.",
     )
+    parser.add_argument(
+        "--dump-base-and-best",
+        action="store_true",
+        help="If set, emit baseline_detail and best_detail sheets with partition/mapping info.",
+    )
+    parser.add_argument(
+        "--enforce-head-divisible",
+        action="store_true",
+        help=(
+            "For qk/kv ops, require the K split product (ch_k*ra_k*de_k*pu_k or ch_k*ra_k*pu_k) to divide nheads."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -491,6 +657,9 @@ def main():
         tk_in = model_cfg["tklen_input"]
         tk_out = model_cfg["tklen_output"]
 
+        baseline_rows = [] if args.dump_base_and_best else None
+        best_rows = [] if args.dump_base_and_best else None
+
         print(f"Processing model {name} on architecture {args.architecture} (L={tk_in}..{tk_out}, batch={batch})")
 
         # 1) Compute shapes at initial L for all ops
@@ -517,6 +686,19 @@ def main():
                 topk=args.topk,
                 cmdthre=args.cmdthre,
                 allow_under_ultize=args.allow_under_ultize,
+                baseline_hook=(
+                    (lambda info, op=op: _append_baseline_row(baseline_rows, op, None, info))
+                    if args.dump_base_and_best
+                    else None
+                ),
+                op_name=op,
+                nheads=nheads,
+                enforce_head_divisible=args.enforce_head_divisible,
+                best_hook=(
+                    (lambda info, op=op: _append_baseline_row(best_rows, op, None, info))
+                    if args.dump_base_and_best
+                    else None
+                ),
             )
             const_baseline[op] = baseline_lat
             const_best[op] = best_lat
@@ -563,6 +745,19 @@ def main():
                     topk=args.topk,
                     cmdthre=args.cmdthre,
                     allow_under_ultize=args.allow_under_ultize,
+                    baseline_hook=(
+                        (lambda info, op=op, L=L: _append_baseline_row(baseline_rows, op, L, info))
+                        if args.dump_base_and_best
+                        else None
+                    ),
+                    op_name=op,
+                    nheads=nheads,
+                    enforce_head_divisible=args.enforce_head_divisible,
+                    best_hook=(
+                        (lambda info, op=op, L=L: _append_baseline_row(best_rows, op, L, info))
+                        if args.dump_base_and_best
+                        else None
+                    ),
                 )
                 row_best[op] = best_lat
                 row_base[op] = baseline_lat
@@ -652,18 +847,68 @@ def main():
             for row in per_op_inst_rows[op]:
                 ws_op.append(row)
 
-        os.makedirs(args.output_dir, exist_ok=True)
-        wb.save(out_path_xlsx)
+        if args.dump_base_and_best and baseline_rows:
+            baseline_header = [
+                "op",
+                "context_len",
+                "M",
+                "K",
+                "L",
+                "B",
+                "bank_per_pim",
+                "MK:input_bank",
+                "sub input(m,k)",
+                "sub_mk_bank reshape(#row,#simd_k)",
+                "KL:weight_bank",
+                "sub weight(k,l)",
+                "sub_kl_bank reshape(#row,#simd_k)",
+                "ML:output_bank",
+                "simd_k",
+                "simd_l",
+                "hw_partition",
+                "mkl_input_to_row",
+                "mkl_output_to_row",
+            ]
+            ws_baseline = wb.create_sheet("baseline_detail")
+            ws_baseline.append(baseline_header)
+            for row in baseline_rows:
+                ws_baseline.append(row)
+
+        if args.dump_base_and_best and best_rows:
+            best_header = [
+                "op",
+                "context_len",
+                "M",
+                "K",
+                "L",
+                "B",
+                "bank_per_pim",
+                "MK:input_bank",
+                "sub input(m,k)",
+                "sub_mk_bank reshape(#row,#simd_k)",
+                "KL:weight_bank",
+                "sub weight(k,l)",
+                "sub_kl_bank reshape(#row,#simd_k)",
+                "ML:output_bank",
+                "simd_k",
+                "simd_l",
+                "hw_partition",
+                "mkl_input_to_row",
+                "mkl_output_to_row",
+            ]
+            ws_best = wb.create_sheet("best_detail")
+            ws_best.append(best_header)
+            for row in best_rows:
+                ws_best.append(row)
 
         if workload_rows is not None:
-            workload_name = f"{norm_name}_{args.architecture}_decode_workload.csv"
-            workload_path = os.path.join(args.output_dir, workload_name)
-            with open(workload_path, "w", newline="") as wf:
-                writer = csv.writer(wf)
-                writer.writerow(["Context_len", "op", "M", "K", "N", "B"])
-                writer.writerows(workload_rows)
-            print(f"  -> wrote workload {workload_path}")
+            ws_workload = wb.create_sheet("workload")
+            ws_workload.append(["Context_len", "op", "M", "K", "N", "B"])
+            for row in workload_rows:
+                ws_workload.append(row)
 
+        os.makedirs(args.output_dir, exist_ok=True)
+        wb.save(out_path_xlsx)
         print(f"  -> wrote {out_path_xlsx}")
 
 

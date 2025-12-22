@@ -1,4 +1,5 @@
 import random
+from tkinter.tix import NoteBook
 from tools import *
 from functools import reduce
 import math
@@ -275,24 +276,26 @@ class Partition(HW_info):
         """
         mm, kk, ll, bb = mm_size
         # Step 1: 列空间分配
-        simd_k = min(kk, self.simd) # K在列中的分块大小
+        simd_k = min(kk, self.simd) # K在列中的分块大小; @note pim的simd大小
         k_col = math.ceil(kk / simd_k) # k占用的列数，最后一列直接做padding，只不过可能吃不满计算并行度
         # Step 2: 行空间分配
         # 一个Row中存放了()的矩阵分块
-        unified_col_num = self.col_num if SimConfig.pu_level == LEVEL.DE else self.bank_num * self.col_num # 兼容不同的PU
+        unified_col_num = self.col_num if SimConfig.pu_level == LEVEL.DE else self.bank_num * self.col_num # 兼容不同的PU：@note pim的bank能放下simd的倍数的列数
         max_k_in_a_row = min(k_col, unified_col_num)
-        max_m_in_a_row = min(mm, unified_col_num)
-        max_l_in_a_row = min(ll, unified_col_num)
-        max_b_in_a_row = min(bb, unified_col_num)
+        max_m_in_a_row = min(mm, unified_col_num) #@note 给出一个理论最大的m块数，假设只放一个k tile
+        max_l_in_a_row = min(ll, unified_col_num) #@note 给出一个理论最大的l块数，假设只放一个k tile
+        max_b_in_a_row = min(bb, unified_col_num) #@note 给出一个理论最大的b块数，假设只放一个k tile
 
         mkl_Input_to_row = [ # 放置时，k维度变化在内层；如果要求2倍数切分、、、
-            (
+            (   #@note 第一个四元组是每行放置的块大小，第二个四元组是行数，第三个四元组是corner case大小
+                # 注意这里的所有都是以simd_k为单位的tile大小
                 (
-                    min(unified_col_num//k_row, max_m_in_a_row), # m_block in a row
-                    k_row, # k_block in a row, 其实应当允许切分，只不过可能大小比较麻烦
-                    min(unified_col_num//k_row, max_l_in_a_row), # l_block in a row
-                    b_row # b_block in a row
+                    min(unified_col_num//k_row, max_m_in_a_row), # m_block in a row；@note ：一行里面能放下几个1xkk的矩阵（几个m索引）
+                    k_row, # k_block in a row, 其实应当允许切分，只不过可能大小比较麻烦；@note ：一行里放几个以simd_k为宽度的块（就是k_row）
+                    min(unified_col_num//k_row, max_l_in_a_row), # l_block in a row；@note ：一行里面能放下几个kkx1的矩阵（几个l索引）
+                    b_row # b_block in a row；@note ：一行里面能放下几个batch（上面所有的举证算一份batch）
                 ),
+
                 (
                     math.ceil(mm/min(unified_col_num//(k_row*b_row), max_m_in_a_row)), # row num for m dimension
                     math.ceil(k_col/k_row), # row num for k dimension
@@ -309,9 +312,59 @@ class Partition(HW_info):
              for b_row in range(1, min(max_b_in_a_row, unified_col_num//k_row)+1) if (self.powerof2(b_row))
         ]
         # 筛选k的取值，从而尽量把空间占满
-        mkl_Input_to_row = list(filter(lambda x: x[0][1] == max_k_in_a_row or x[0][0]*x[0][3]*(x[0][1]+1) > unified_col_num or x[0][2]*x[0][3]*(x[0][1]+1) > unified_col_num, mkl_Input_to_row))        
+        # ==============================
+        # @note 这一步是在做“映射方案剪枝”（不是计算）
+        # ==============================
+        # mkl_Input_to_row 第一个四元组中的每一个元素，表示：
+        #   - 一行 PIM row 内如何并行放置 (m, k, l, b)
+        #   - 整个矩阵需要铺多少行
+        # 的候选映射方案
+        #
+        # 但前面的枚举会生成大量“明显不可能是最优”的方案，例如：
+        #   - k 并行度很小（算力没吃满，这个剪枝方案希望最大化reduction维度也就是k维度的并行度）
+        #   - m / l / b 也没吃满
+        #   - 行内资源还大量空闲
+        #
+        # 下面的 filter 不是物理约束，而是经验性剪枝：
+        #   只保留“已经把一行资源用到极限附近”的方案，
+        #   丢掉那些资源明显没用满的“内部点”。
+
+        mkl_Input_to_row = list(filter(
+            lambda x: # x[0]是 mkl_Input_to_row 中第一个四元组
+                # 条件 1：
+                # x[0][1] 是 k 维度在一行内放了多少个 tile，一个 tile 宽度是 simd_k
+                # 如果这一行里的 k 并行度已经达到最大值，
+                # 说明 reduction 维度已经吃满，
+                # 即使 m / l 并行度较小，也值得保留
+                x[0][1] == max_k_in_a_row
+                or
+
+                # 条件 2：
+                # x[0][0] 是 m 维度在一行内多少个m索引，tile大小是m x simd_k
+                # x[0][3] 是 b 维度在一行内多少个b索引，多少个batch
+                # 在当前 m_block 和 b_row 的并行规模下，一行内已经放了
+                # batch x mm x simd_k 的数据
+                # 如果 k 再增加 1 个 tile，
+                # 行内所需的列数就会超过一行的容量 unified_col_num，
+                # 说明这是一个“贴着容量上限”的 m 方向极限方案
+                x[0][0] * x[0][3] * (x[0][1] + 1) > unified_col_num
+                or
+
+                # 条件 3：
+                # x[0][2] 是 l 维度在一行内多少个l索引，tile大小是l x simd_k
+                # x[0][3] 是 b 维度在一行内多少个b索引，多少个batch
+                # 在当前 l_block 和 b_row 的并行规模下，一行内已经放了
+                # batch x ll x simd_k 的数据
+                # 与条件 2 类似，只是把 m 换成 l，
+                # 表示这是一个在 l 方向上已经贴近行容量上限的方案
+                x[0][2] * x[0][3] * (x[0][1] + 1) > unified_col_num,
+
+            # 对 mkl_Input_to_row 中的所有候选映射进行筛选
+            mkl_Input_to_row
+        ))
+
         """
-        output: mm * ll * bb, col只分配l维度较为合理，因为l会是下一次的reduce维度
+        output: mm * ll * bb, col只分配l维度较为合\理，因为l会是下一次的reduce维度
         """
         simd_l = min(ll, self.simd)
         l_col = math.ceil(ll / simd_l)
