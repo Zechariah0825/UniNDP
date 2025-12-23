@@ -783,7 +783,7 @@ def main():
         # 4) Write per-model Excel workbook with three sheets
         norm_name = _normalize_model_name(name)
         out_path_xlsx = os.path.join(
-            args.output_dir, f"{norm_name}_{args.architecture}_decode_metrics.xlsx"
+            args.output_dir, f"{norm_name}_b{batch}_{args.architecture}_decode_metrics.xlsx"
         )
 
         wb = Workbook()
