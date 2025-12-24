@@ -1,0 +1,1 @@
+python pax/compile_e2e_pax.py --models-csv script/models_llm.csv --model GPT3-2.7B --architecture hbm-pim --batchsize 64 --output-dir debug --po2 --cmdthre 3.0 --topk 5 --dump-workload --dump-base-and-best --enforce-head-divisible

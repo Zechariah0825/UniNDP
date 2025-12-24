@@ -85,17 +85,19 @@ def _append_baseline_row(rows, op, context_len, info):
         div_m = ch[0] * ra[0] * pu[0]
         div_k = ch[1] * ra[1] * pu[1]
         div_l = ch[2] * ra[2] * pu[2]
+    div_b = 1 #@todo 因为batch维度合并进了m维度，所以这里先写死为1
 
-    m_sub = ceil(m / div_m)
+    mb_sub = ceil((m*b) / (div_m*div_b))
     k_sub = ceil(k / div_k)
     l_sub = ceil(l / div_l)
 
     mkl_in = info["mkl_input_to_row"]
     blk = mkl_in[0]
-    rows_k = mkl_in[1][1]
+    row = mkl_in[1]
+    m_row, k_row, l_row, b_row =row
     m_blk, k_blk, l_blk, _ = blk
-    sub_mk_bank = (rows_k, m_blk * k_blk)
-    sub_kl_bank = (rows_k, l_blk * k_blk)
+    sub_mbk_bank = (m_row*k_row*b_row, m_blk * k_blk)
+    sub_kl_bank = (l_row*k_row, l_blk * k_blk)
 
     rows.append(
         [
@@ -107,8 +109,8 @@ def _append_baseline_row(rows, op, context_len, info):
             b,
             info["bank_per_pim"],
             info["input_bank"],
-            f"{m_sub},{k_sub}",
-            f"{sub_mk_bank[0]},{sub_mk_bank[1]}",
+            f"{mb_sub},{k_sub}",
+            f"{sub_mbk_bank[0]},{sub_mbk_bank[1]}",
             info["weight_bank"],
             f"{k_sub},{l_sub}",
             f"{sub_kl_bank[0]},{sub_kl_bank[1]}",
@@ -457,10 +459,11 @@ def decode_mm_shapes(
     gqaheads: int,
     L: int,
     batch: int,
+    is_llama: bool = False,
 ):
     """
-    Return MM workload shapes for decode phase for the six ops:
-    qkv_gen, qk, kv, out_proj, up, down.
+    Return MM workload shapes for decode phase for the ops:
+    qkv_gen, qk, kv, out_proj, up, (gate if LLaMA), down.
     Shapes are tuples (M, K, N, B).
     """
     ff_dim = int(round(hdim * ff_scale))
@@ -474,11 +477,11 @@ def decode_mm_shapes(
     shapes["qkv_gen"] = (1, hdim, 3 * hdim, batch)
 
     if use_gqa:
-        group_dim = dhead * kv_heads  # = d_model / groups
+        kvdhead=hdim // kv_heads
         # Q: (groups, d_model/groups), K: (d_model/groups, L)
-        shapes["qk"] = (groups, group_dim, L, batch)
-        # S: (groups, nheads*L), V: (nheads*L, dhead)
-        shapes["kv"] = (groups, nheads * L, dhead, batch)
+        shapes["qk"] = (groups, hdim // groups, L, batch)
+        # S: (groups, kv_heads*L), V: (kv_heads*L, dhead)
+        shapes["kv"] = (groups, kv_heads * L, kvdhead, batch)
     else:
         # MHA flattening
         # Q: (1, d_model), K: (d_model, L)
@@ -489,6 +492,8 @@ def decode_mm_shapes(
     # Out projection and FFN
     shapes["out_proj"] = (1, hdim, hdim, batch)
     shapes["up"] = (1, hdim, ff_dim, batch)
+    if is_llama:
+        shapes["gate"] = (1, hdim, ff_dim, batch)
     shapes["down"] = (1, ff_dim, hdim, batch)
 
     return shapes
@@ -649,6 +654,7 @@ def main():
     batch=args.batchsize
     for model_cfg in parse_models_csv(args.models_csv, args.model):
         name = model_cfg["name"]
+        is_llama = "llama" in name.lower()
         hdim = model_cfg["hdim"]
         nheads = model_cfg["nheads"]
         dhead = model_cfg["dhead"]
@@ -663,11 +669,13 @@ def main():
         print(f"Processing model {name} on architecture {args.architecture} (L={tk_in}..{tk_out}, batch={batch})")
 
         # 1) Compute shapes at initial L for all ops
-        shapes_initial = decode_mm_shapes(hdim, nheads, dhead, ff_scale, gqaheads, tk_in, batch)
+        shapes_initial = decode_mm_shapes(
+            hdim, nheads, dhead, ff_scale, gqaheads, tk_in, batch, is_llama=is_llama
+        )
 
         # 2) Run single-mm compile for ops whose shapes don't change with L:
-        #    qkv_gen, out_proj, up, down
-        const_ops = ["qkv_gen", "out_proj", "up", "down"]
+        #    qkv_gen, out_proj, up, (gate for LLaMA), down
+        const_ops = ["qkv_gen", "out_proj", "up"] + (["gate"] if is_llama else []) + ["down"]
         const_baseline = {}
         const_best = {}
         const_speedup = {}
@@ -710,17 +718,20 @@ def main():
         rows_best = []
         rows_baseline = []
         # Per-op per-L instruction-level latency breakdown
-        per_op_inst_rows = {op: [] for op in ["qkv_gen", "qk", "kv", "out_proj", "up", "down"]}
+        ops_all = ["qkv_gen", "qk", "kv", "out_proj", "up"] + (["gate"] if is_llama else []) + ["down"]
+        per_op_inst_rows = {op: [] for op in ops_all}
         workload_rows = [] if args.dump_workload else None
 
         for L in range(tk_in, tk_out + 1):
-            shapes = decode_mm_shapes(hdim, nheads, dhead, ff_scale, gqaheads, L, batch)
+            shapes = decode_mm_shapes(
+                hdim, nheads, dhead, ff_scale, gqaheads, L, batch, is_llama=is_llama
+            )
             row_speed = {"Context_len": L}
             row_best = {"Context_len": L}
             row_base = {"Context_len": L}
 
             if workload_rows is not None:
-                for op in ["qkv_gen", "qk", "kv", "out_proj", "up", "down"]:
+                for op in ops_all:
                     M, K, N, B = shapes[op]
                     workload_rows.append([L, op, M, K, N, B])
 
@@ -776,6 +787,11 @@ def main():
                     [L] + list((np.array(best_ic, dtype=float)[:inst_len] * predictor_vec).tolist())
                 )
 
+            # 计算 E2E：基于该 L 下所有算子 baseline/best 的周期和
+            baseline_total = sum(row_base[op] for op in ops_all)
+            best_total = sum(row_best[op] for op in ops_all)
+            row_speed["E2E"] = baseline_total / best_total if best_total else 1.0
+
             rows_speedup.append(row_speed)
             rows_best.append(row_best)
             rows_baseline.append(row_base)
@@ -788,60 +804,31 @@ def main():
 
         wb = Workbook()
 
-        header = ["Context_len", "qkv_gen", "qk", "kv", "out_proj", "up", "down"]
+        header_speedup = ["Context_len"] + ops_all + ["E2E"]
+        header_latency = ["Context_len"] + ops_all
 
         # Sheet 1: speedup
         ws_speed = wb.active
         ws_speed.title = "speedup"
-        ws_speed.append(header)
+        ws_speed.append(header_speedup)
         for row in rows_speedup:
-            ws_speed.append(
-                [
-                    row["Context_len"],
-                    row["qkv_gen"],
-                    row["qk"],
-                    row["kv"],
-                    row["out_proj"],
-                    row["up"],
-                    row["down"],
-                ]
-            )
+            ws_speed.append([row["Context_len"]] + [row[op] for op in ops_all] + [row["E2E"]])
 
         # Sheet 2: best latency
         ws_best = wb.create_sheet("best_latency")
-        ws_best.append(header)
+        ws_best.append(header_latency)
         for row in rows_best:
-            ws_best.append(
-                [
-                    row["Context_len"],
-                    row["qkv_gen"],
-                    row["qk"],
-                    row["kv"],
-                    row["out_proj"],
-                    row["up"],
-                    row["down"],
-                ]
-            )
+            ws_best.append([row["Context_len"]] + [row[op] for op in ops_all])
 
         # Sheet 3: baseline latency
         ws_base = wb.create_sheet("baseline_latency")
-        ws_base.append(header)
+        ws_base.append(header_latency)
         for row in rows_baseline:
-            ws_base.append(
-                [
-                    row["Context_len"],
-                    row["qkv_gen"],
-                    row["qk"],
-                    row["kv"],
-                    row["out_proj"],
-                    row["up"],
-                    row["down"],
-                ]
-            )
+            ws_base.append([row["Context_len"]] + [row[op] for op in ops_all])
 
         # Additional sheets: per-operator instruction-level latency breakdown
         inst_header_row = ["Context_len"] + inst_headers
-        for op in ["qkv_gen", "qk", "kv", "out_proj", "up", "down"]:
+        for op in ops_all:
             ws_op = wb.create_sheet(op)
             ws_op.append(inst_header_row)
             for row in per_op_inst_rows[op]:
@@ -857,8 +844,8 @@ def main():
                 "B",
                 "bank_per_pim",
                 "MK:input_bank",
-                "sub input(m,k)",
-                "sub_mk_bank reshape(#row,#simd_k)",
+                "sub input(mb,k)",
+                "sub_mbk_bank reshape(#row,#simd_k)",
                 "KL:weight_bank",
                 "sub weight(k,l)",
                 "sub_kl_bank reshape(#row,#simd_k)",
